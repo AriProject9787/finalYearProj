@@ -5,7 +5,6 @@ import numpy as np
 from PIL import Image
 import os
 import time
-import requests
 
 # --- APP CONFIGURATION ---
 st.set_page_config(
@@ -51,118 +50,18 @@ st.markdown("""
 # --- CONSTANTS ---
 IMG_SIZE_CLS = 224
 IMG_SIZE_SEG = 256
-CLASSIFIER_ID = "1nQmClRILftvZe8C82mLR6VsYNlodu9w9"
 CLASSIFIER_MODEL_PATH = "classifier.h5"
 SEGMENTATION_MODEL_PATH = "segmentation.h5"
-
-# --- HELPER: GDrive Download ---
-def download_file_from_google_drive(id, destination):
-    URL = "https://docs.google.com/uc?export=download"
-    session = requests.Session()
-    response = session.get(URL, params={'id': id}, stream=True)
-    
-    def get_confirm_token(response):
-        # 1. Try to get from cookies
-        for key, value in response.cookies.items():
-            if key.startswith('download_warning'):
-                return value
-        
-        # 2. Try to get from HTML content (Virus Scan Warning page)
-        import re
-        content = response.text
-        # Google Drive sometimes uses: confirm=XXX&id=YYY or "confirm":"XXX"
-        # We'll use a more aggressive regex
-        match = re.search(r'confirm=([0-9A-Za-z_-]+)', content)
-        if not match:
-            # Try searching for the input name="confirm" value="XXX"
-            match = re.search(r'name="confirm" value="([0-9A-Za-z_-]+)"', content)
-        if match:
-            return match.group(1)
-        return None
-
-    token = get_confirm_token(response)
-    if token:
-        params = {'id': id, 'confirm': token}
-        response = session.get(URL, params=params, stream=True)
-    
-    total_size = int(response.headers.get('content-length', 0))
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    status_text.text(f"Downloading model: {destination}...")
-    
-    CHUNK_SIZE = 32768
-    downloaded = 0
-    with open(destination, "wb") as f:
-        for chunk in response.iter_content(CHUNK_SIZE):
-            if chunk:
-                f.write(chunk)
-                downloaded += len(chunk)
-                if total_size > 0:
-                    progress_perc = min(downloaded / total_size, 1.0)
-                    progress_bar.progress(progress_perc)
-    
-    progress_bar.empty()
-    status_text.empty()
-    
-    # Final Validation: Check HDF5 signature
-    with open(destination, "rb") as f:
-        header = f.read(8)
-        if header != b"\x89HDF\r\n\x1a\n":
-            os.remove(destination)
-            raise ValueError("Invalid model file format. Please download manually.")
 
 # --- MODEL LOADING WITH CACHING ---
 @st.cache_resource
 def load_models():
     try:
-        # Check if classifier exists
-        if not os.path.exists(CLASSIFIER_MODEL_PATH):
-            st.info("🚀 Initial Setup: Classifier model missing.")
-            
-            # 1. Attempt Automated Download
-            # We use a session state to prevent infinite loops if download fails repeatedly
-            if "download_attempted" not in st.session_state:
-                st.session_state.download_attempted = False
-            
-            if not st.session_state.download_attempted:
-                with st.spinner("Attempting to download model from Google Drive..."):
-                    try:
-                        download_file_from_google_drive(CLASSIFIER_ID, CLASSIFIER_MODEL_PATH)
-                        st.success("Download complete!")
-                        st.rerun()
-                    except Exception as e:
-                        st.session_state.download_attempted = True
-                        st.error(f"⚠️ Automated download failed: {e}")
-            
-            # 2. Fallback: Manual Upload
-            st.markdown(f"""
-            ### 📥 Manual Model Setup Required
-            GitHub has a 100MB limit, so the large **classifier.h5** model must be added manually:
-            1. [Click here to download classifier.h5](https://drive.google.com/uc?export=download&id={CLASSIFIER_ID})
-            2. **Upload** the file below once downloaded.
-            """)
-            
-            uploaded_file = st.file_uploader("Upload 'classifier.h5' directly", type=["h5"], key="model_uploader")
-            if uploaded_file:
-                with open(CLASSIFIER_MODEL_PATH, "wb") as f:
-                    f.write(uploaded_file.getbuffer())
-                st.success("Model saved successfully! Reloading...")
-                st.rerun()
-            
-            return None, None
-        
-        # Check if segmentation exists
-        if not os.path.exists(SEGMENTATION_MODEL_PATH):
-            st.error(f"Error: {SEGMENTATION_MODEL_PATH} not found.")
-            return None, None
-
         classifier = tf.keras.models.load_model(CLASSIFIER_MODEL_PATH)
         seg_model = tf.keras.models.load_model(SEGMENTATION_MODEL_PATH)
         return classifier, seg_model
     except Exception as e:
         st.error(f"Error loading models: {e}")
-        if os.path.exists(CLASSIFIER_MODEL_PATH):
-            os.remove(CLASSIFIER_MODEL_PATH)
         return None, None
 
 # --- CORE LOGIC ---
