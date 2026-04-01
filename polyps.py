@@ -165,14 +165,31 @@ def load_models():
             os.remove(CLASSIFIER_MODEL_PATH)
         return None, None
 
+def remove_specular_reflection(img):
+    # Convert to grayscale
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    # Threshold for very bright spots (reflective glare)
+    _, mask = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY)
+    
+    # Expand the mask slightly to ensure full coverage
+    mask = cv2.dilate(mask, np.ones((5, 5), np.uint8), iterations=1)
+    
+    # Inpaint using Telea's algorithm
+    return cv2.inpaint(img, mask, 3, cv2.INPAINT_TELEA)
+
 # --- CORE LOGIC ---
-def process_image(img, classifier, seg_model):
+def process_image(img, classifier, seg_model, apply_removal=False):
+    # Apply preprocessing if enabled
+    if apply_removal:
+        img = remove_specular_reflection(img)
+
     # 1. Classification
     img_cls = cv2.resize(img, (IMG_SIZE_CLS, IMG_SIZE_CLS))
     img_cls_norm = img_cls.astype(np.float32) / 255.0
     prob = classifier.predict(np.expand_dims(img_cls_norm, axis=0), verbose=0)[0][0]
     
-    is_polyp = prob >= 0.5
+    is_polyp = prob >= 0.3
     confidence = prob if is_polyp else (1 - prob)
     
     mask = None
@@ -195,6 +212,34 @@ def process_image(img, classifier, seg_model):
         mask = (binary_mask.squeeze() * 255).astype(np.uint8)
         
     return is_polyp, confidence, severity, mask, overlay
+
+def create_combined_result(img, mask, overlay):
+    # Standardize all to 256x256
+    s = 256
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img_res = cv2.resize(img_rgb, (s, s))
+    
+    if mask is not None:
+        mask_rgb = cv2.cvtColor(mask, cv2.COLOR_GRAY2RGB)
+        mask_res = cv2.resize(mask_rgb, (s, s))
+    else:
+        # Create a blank black mask if no polyp detected
+        mask_res = np.zeros((s, s, 3), dtype=np.uint8)
+        
+    overlay_res = cv2.resize(overlay, (s, s)) if overlay is not None else img_res
+
+    # Concatenate horizontally with white separators
+    sep = np.ones((s, 5, 3), dtype=np.uint8) * 255
+    combined = np.hstack([img_res, sep, mask_res, sep, overlay_res])
+    
+    # Add labels using OpenCV (optional but helps clarity)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    cv2.putText(combined, "Original", (10, 20), font, 0.6, (255, 255, 255), 2)
+    cv2.putText(combined, "Mask", (s + 15, 20), font, 0.6, (255, 255, 255), 2)
+    cv2.putText(combined, "Result", (2*s + 20, 20), font, 0.6, (255, 255, 255), 2)
+
+    return Image.fromarray(combined)
+
 
 # --- UI LAYOUT ---
 def main():
@@ -231,10 +276,12 @@ def main():
             col1, col2 = st.columns([1, 1])
             with col1:
                 st.subheader("Input Image")
-                st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), use_column_width=True)
+                # Preprocessing Toggle
+                apply_removal = st.checkbox("Apply Specular Reflection Removal", value=True, help="Removes bright white glare to improve detection.")
+                st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), use_container_width=True)
             
             with st.spinner("Analyzing tissue samples..."):
-                is_polyp, conf, severity, mask, overlay = process_image(img, classifier, seg_model)
+                is_polyp, conf, severity, mask, overlay = process_image(img, classifier, seg_model, apply_removal)
                 
                 with col2:
                     st.subheader("Analysis Metrics")
@@ -260,11 +307,12 @@ def main():
                     st.image(overlay, caption="Overlay Visualization", use_container_width=True)
                 
                 # Download button
-                pil_img = Image.fromarray(overlay)
+                combined_pil = create_combined_result(img, mask, overlay)
                 from io import BytesIO
                 buf = BytesIO()
-                pil_img.save(buf, format="PNG")
-                st.download_button(label="Download Resulting Image", data=buf.getvalue(), file_name="polyp_analysis.png", mime="image/png")
+                combined_pil.save(buf, format="PNG")
+                st.download_button(label="Download Combined Analysis", data=buf.getvalue(), file_name="polyp_composite.png", mime="image/png")
+
 
     elif app_mode == "Live Stream / Video":
         st.title("Real-Time & Video Polyp Analysis")
@@ -275,6 +323,15 @@ def main():
         with tab1:
             uploaded_video = st.file_uploader("Upload a video file...", type=["mp4", "avi", "mov", "mkv"])
             if uploaded_video is not None:
+                # Initialize session state for stats to persist through button clicks
+                if "video_stats" not in st.session_state or st.session_state.get("last_video") != uploaded_video.name:
+                    st.session_state.video_stats = {
+                        "polyp_frames": 0,
+                        "max_conf": 0.0,
+                        "processed_count": 0
+                    }
+                    st.session_state.last_video = uploaded_video.name
+
                 import tempfile
                 from collections import deque
                 
@@ -290,9 +347,47 @@ def main():
                     st.info(f"Video Loaded: {total_frames} frames detected.")
                     
                     # --- CONTROL PANEL ---
+                    with st.expander("⚙️ Analysis Settings", expanded=True):
+                        c1, c2 = st.columns(2)
+                        frame_range = c1.slider("Select Frame Range", 0, total_frames, (0, total_frames))
+                        skip_step = c2.select_slider("Analysis Speed / Skip Rate", options=[1, 2, 5, 10, 25, 50], value=2, 
+                                                   help="Higher values skip more frames, speeding up discovery. '1' processes every frame.")
+                        apply_removal = st.checkbox("Specular Reflection Removal (Experimental)", value=True)
+                        start_frame, end_frame = frame_range
+
+                    with st.expander("🎯 Analyze Particular Frame"):
+                        col_f1, col_f2 = st.columns([3, 1])
+                        target_f = col_f1.slider("Seek Frame", start_frame, end_frame, start_frame)
+                        status_msg = st.empty()
+                        if col_f2.button("Run Analysis", use_container_width=True):
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, target_f)
+                            ret, f_img = cap.read()
+                            if ret:
+                                with st.spinner("Processing..."):
+                                    is_p, c, s, m, o = process_image(f_img, classifier, seg_model, apply_removal)
+                                    st.image(o if is_p else cv2.cvtColor(f_img, cv2.COLOR_BGR2RGB), caption=f"Analysis of Frame {target_f}", use_container_width=True)
+                                    res_c1, res_c2 = st.columns(2)
+                                    res_c1.metric("Status", "Polyp" if is_p else "Clear")
+                                    res_c2.metric("Confidence", f"{c*100:.1f}%")
+                                    
+                                    # Download button for single frame
+                                    combined_pil = create_combined_result(f_img, m, o)
+                                    from io import BytesIO
+                                    buf = BytesIO()
+                                    combined_pil.save(buf, format="PNG")
+                                    st.download_button(label="Download This Frame Analysis", data=buf.getvalue(), 
+                                                       file_name=f"frame_{target_f}_analysis.png", mime="image/png", key=f"dl_{target_f}")
+                            else:
+                                st.error("Failed to read frame.")
+
+                    st.markdown("### 📽️ Bulk Video Analysis")
                     c1, c2, c3 = st.columns(3)
                     is_paused = c1.toggle("Pause Analysis", value=False)
                     stop_btn = c2.button("Stop & Show Result", type="secondary")
+                    
+                    # Set start frame
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+                    current_f = start_frame
                     
                     # Progress bar
                     prog_bar = st.progress(0)
@@ -306,18 +401,14 @@ def main():
                     
                     frame_placeholder = st.empty()
                     
-                    # Analysis Stats
-                    stats = {
-                        "polyp_frames": 0,
-                        "max_conf": 0.0,
-                        "timestamps": [],
-                        "processed_count": 0
-                    }
+                    # Analysis Stats (using session state to persist through stop button)
+                    stats = st.session_state.video_stats
+
                     
                     # Accuracy Buffer (Temporal Smoothing)
                     prediction_buffer = deque(maxlen=5) 
                     
-                    while cap.isOpened():
+                    while cap.isOpened() and current_f <= end_frame:
                         if stop_btn:
                             break
                         
@@ -329,46 +420,43 @@ def main():
                         if not ret:
                             break
                         
+                        current_f += 1
+                        
+                        # Implementation of Speed/Skip
+                        if skip_step > 1:
+                            for _ in range(skip_step - 1):
+                                cap.grab()
+                                current_f += 1
+                        
+                        # Use unified process_image logic
+                        is_detected, conf, severity, mask, overlay_vid = process_image(frame, classifier, seg_model, apply_removal)
                         stats["processed_count"] += 1
-                        
-                        # Classification
-                        img_cls = cv2.resize(frame, (IMG_SIZE_CLS, IMG_SIZE_CLS))
-                        prob = classifier.predict(np.expand_dims(img_cls.astype(np.float32)/255.0, axis=0), verbose=0)[0][0]
-                        
-                        prediction_buffer.append(prob)
-                        avg_prob = sum(prediction_buffer) / len(prediction_buffer)
-                        
-                        display_frame = frame.copy()
-                        is_detected = avg_prob >= 0.5
                         
                         if is_detected:
                             stats["polyp_frames"] += 1
-                            stats["max_conf"] = max(stats["max_conf"], avg_prob)
+                            stats["max_conf"] = max(stats["max_conf"], conf)
                             
-                            img_seg = cv2.resize(frame, (IMG_SIZE_SEG, IMG_SIZE_SEG))
-                            mask_pred = seg_model.predict(np.expand_dims(img_seg.astype(np.float32)/255.0, axis=0), verbose=0)[0]
-                            binary_mask = (mask_pred > 0.3).astype(np.uint8)
-                            
-                            mask_resized = cv2.resize(binary_mask, (frame.shape[1], frame.shape[0]))
-                            display_frame[mask_resized == 1] = [0, 255, 0]
-                            
-                            severity = round((np.sum(binary_mask) / (IMG_SIZE_SEG * IMG_SIZE_SEG)) * 100, 2)
-                            
-                            conf_placeholder.markdown(f"<div class='metric-card'><h3>Confidence</h3><h2>{avg_prob*100:.1f}%</h2></div>", unsafe_allow_html=True)
+                            display_frame = overlay_vid
+                            conf_placeholder.markdown(f"<div class='metric-card'><h3>Confidence</h3><h2>{conf*100:.1f}%</h2></div>", unsafe_allow_html=True)
                             sev_placeholder.markdown(f"<div class='metric-card'><h3>Severity</h3><h2>{severity}%</h2></div>", unsafe_allow_html=True)
                             verdict_placeholder.markdown(f"<div class='metric-card'><h3 style='color:red;'>STATUS</h3><h2>POLYP</h2></div>", unsafe_allow_html=True)
+                            # Add text on frame for visual confirmation
                             cv2.putText(display_frame, "POLYP DETECTED", (30, 80), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 5)
                         else:
-                            conf_placeholder.markdown(f"<div class='metric-card'><h3>Confidence</h3><h2>{(1-avg_prob)*100:.1f}%</h2></div>", unsafe_allow_html=True)
+                            display_frame = frame.copy()
+                            conf_placeholder.markdown(f"<div class='metric-card'><h3>Confidence</h3><h2>{(1-conf)*100:.1f}%</h2></div>", unsafe_allow_html=True)
                             sev_placeholder.markdown(f"<div class='metric-card'><h3>Severity</h3><h2>0.0%</h2></div>", unsafe_allow_html=True)
                             verdict_placeholder.markdown(f"<div class='metric-card'><h3 style='color:green;'>STATUS</h3><h2>CLEAR</h2></div>", unsafe_allow_html=True)
                             cv2.putText(display_frame, "CLEAR", (30, 80), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 4)
                         
-                        frame_placeholder.image(cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB), use_column_width=True)
+                        frame_placeholder.image(cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB), use_container_width=True)
                         
-                        progress = min(stats["processed_count"] / total_frames, 1.0)
+                        # Normalized Progress considering start/end range
+                        total_to_process = (end_frame - start_frame) if (end_frame > start_frame) else 1
+                        progress = min((current_f - start_frame) / total_to_process, 1.0)
                         prog_bar.progress(progress)
-                        frame_text.text(f"Processing Frame: {stats['processed_count']} / {total_frames}")
+                        frame_text.text(f"Processing Frame: {current_f} / {end_frame} (Speed: {skip_step}x)")
+
                     
                     cap.release()
                     time.sleep(0.1) # Small buffer for Windows file release
@@ -403,7 +491,7 @@ def main():
         with tab2:
             st.warning("Ensure your camera is connected and not used by another application.")
             run = st.toggle('Start Webcam Stream', value=False)
-            FRAME_WINDOW = st.image([], use_column_width=True)
+            FRAME_WINDOW = st.image([], use_container_width=True)
             
             if run:
                 cap = cv2.VideoCapture(0)
@@ -421,7 +509,7 @@ def main():
                     prob = classifier.predict(np.expand_dims(img_cls_norm, axis=0), verbose=0)[0][0]
                     
                     display_frame = frame.copy()
-                    if prob >= 0.5:
+                    if prob >= 0.3:
                         img_seg = cv2.resize(frame, (IMG_SIZE_SEG, IMG_SIZE_SEG))
                         mask_pred = seg_model.predict(np.expand_dims(img_seg.astype(np.float32)/255.0, axis=0), verbose=0)[0]
                         binary_mask = (mask_pred > 0.4).astype(np.uint8)
@@ -432,7 +520,7 @@ def main():
                     else:
                         cv2.putText(display_frame, f"CLEAR ({ (1-prob)*100:.1f}%)", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
                     
-                    FRAME_WINDOW.image(cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB), use_column_width=True)
+                    FRAME_WINDOW.image(cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB), use_container_width=True)
                 
                 cap.release()
 
