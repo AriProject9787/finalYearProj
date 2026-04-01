@@ -52,7 +52,7 @@ Experience the portal live: [https://ai-polyp-detector-ariramaselvam.streamlit.a
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/Ariramaselvam/finalYearProj.git
+   git clone https://github.com/AriProject9787/finalYearProj
    cd finalYearProj
    ```
 
